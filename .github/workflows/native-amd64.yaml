@@ -1,0 +1,128 @@
+name: Native amd64 validation of patched f86d864
+
+'on':
+  push:
+    branches: [ci/plex-kube-vip-f86d864]
+    paths:
+      - .github/workflows/native-amd64.yaml
+      - testing/native-amd64/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.repository == 'chris-cald/kube-vip' && github.ref == 'refs/heads/ci/plex-kube-vip-f86d864'
+    runs-on: ubuntu-24.04
+    env:
+      EXPECTED_SHA: f86d86485743b3ee84626b50511495810c79839e
+      EXPECTED_VERSION: v1.3.1
+      IMAGE: kube-vip:f86d86485743b3ee84626b50511495810c79839e
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout validation harness only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: harness
+          sparse-checkout: |
+            testing/native-amd64
+            .github/workflows/native-amd64.yaml
+          sparse-checkout-cone-mode: false
+      - name: Checkout immutable source (not workflow ref)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: chris-cald/kube-vip
+          ref: f86d86485743b3ee84626b50511495810c79839e
+          persist-credentials: false
+          path: source
+      - name: Verify native disposable runner and source
+        id: preflight
+        run: |
+          set -euo pipefail
+          mkdir -p evidence test-bin
+          {
+            test "$(uname -s)" = Linux
+            test "$(uname -m)" = x86_64
+            test "$RUNNER_ARCH" = X64
+            bash harness/testing/native-amd64/verify-driver.sh
+            test "$(docker info --format '{{.Architecture}}')" = x86_64
+            test "$(git -C source rev-parse HEAD)" = "$EXPECTED_SHA"
+            test -z "$(git -C source status --porcelain)"
+            printf 'source=%s\nworkflow=%s\nrun=%s/%s/actions/runs/%s\n' \
+              "$EXPECTED_SHA" "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            uname -a
+            docker version
+            sha256sum source/Dockerfile source/Makefile source/go.mod source/go.sum
+          } 2>&1 | tee evidence/preflight.log
+      - name: Install exact Go version matching upstream Dockerfile
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Compile full native package test binaries
+        id: compile
+        run: |
+          set -euo pipefail
+          {
+            test "$(go env GOHOSTARCH)" = amd64
+            test "$(go env GOHOSTOS)" = linux
+            go version
+            cd source
+            for package in vip services instance; do
+              CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOTOOLCHAIN=local \
+                go test -c -mod=readonly -o "../test-bin/$package.test" "./pkg/$package"
+            done
+            go mod verify
+            test -z "$(git status --porcelain)"
+            sha256sum ../test-bin/*.test
+          } 2>&1 | tee evidence/compile.log
+      - name: Run full packages inside isolated least-capability containers
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
+        run: bash harness/testing/native-amd64/run-tests.sh "$PWD/test-bin" "$PWD/evidence"
+      - name: Account for every result and require real DHCP lifecycle passes
+        if: always()
+        run: |
+          status=0
+          python3 harness/testing/native-amd64/report.py source evidence || status=$?
+          cat evidence/summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: Build unchanged upstream Dockerfile using existing daemon
+        id: image
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
+        env:
+          BUILDX_METADATA_PROVENANCE: max
+        run: |
+          set -euo pipefail
+          bash harness/testing/native-amd64/verify-driver.sh | tee evidence/build-driver.log
+          docker buildx version | tee evidence/buildx-version.log
+          docker buildx build --builder default --load --platform linux/amd64 --pull --progress=plain \
+            --provenance=false --metadata-file evidence/build-metadata.json \
+            --tag "$IMAGE" --file source/Dockerfile source 2>&1 | tee evidence/image-build.log
+          docker image save --output evidence/kube-vip.docker.tar "$IMAGE"
+      - name: Verify image architecture, embedded Version and Build, and saved archive
+        if: ${{ !cancelled() && steps.image.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          docker image inspect "$IMAGE" > evidence/image-inspect.json
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")" = linux/amd64
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges=true "$IMAGE" version 2>&1 | tee evidence/version.log
+          grep -Fx "Version:  $EXPECTED_VERSION" evidence/version.log
+          grep -Fx "Build:    $EXPECTED_SHA" evidence/version.log
+          python3 harness/testing/native-amd64/verify-archive.py evidence/kube-vip.docker.tar \
+            evidence/image-inspect.json "$IMAGE" | tee evidence/archive-verification.json
+          sha256sum evidence/kube-vip.docker.tar > evidence/kube-vip.docker.tar.sha256
+          cat evidence/archive-verification.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve evidence even on failure (not registry publication)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-amd64-f86d864-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          compression-level: 0
