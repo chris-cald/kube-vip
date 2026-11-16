@@ -80,7 +80,11 @@ both into a scratch image. No private CA or protected input is needed. We do
 Both builds explicitly select `--builder default --load`. Before any build,
 `verify-driver.sh` performs read-only checks: no Docker host/context overrides,
 active context `default`, its local `/var/run/docker.sock` endpoint, and
-`docker buildx inspect default --format '{{.Driver}}'` exactly `docker`.
+`docker buildx inspect default` succeeding with exactly one `Driver:` field
+whose entire value is `docker` (display whitespace is tolerated). Missing,
+duplicate or other driver fields, extra values, and command failures are rejected.
+Plain inspection avoids the unsupported `inspect --format` option on older
+hosted Buildx versions; the context/socket checks are unchanged.
 There is no bootstrap, builder creation/switch, daemon configuration change,
 setup-buildx action, docker-container builder, Docker-in-Docker, additional
 privileged container, or fallback driver. A mismatch fails closed. The image
@@ -210,3 +214,12 @@ of alternate drivers/host overrides. Replacement Docker archive tests failed
 before implementation, then passed for raw/gzip layers and seven rejection
 cases (tag, config, layer, local ID, layer count, platform and duplicates).
 Native GitHub validation remains pending; offline tests do not exercise Docker.
+
+Run `43674026655`, attempt 1 (job `132690101334`), failed preflight before
+compilation/tests/build. Parent-retrieved logs identified `unknown flag:
+--format` from `docker buildx inspect`, exit 125. That failed attempt is retained.
+The compatibility regression fixture now reproduces that unsupported flag
+instead of accepting it. It failed before the plain-inspection fix and passes
+with nine cases covering valid output/spacing and fail-closed rejection paths.
+The original fake CLI missed this runner-version incompatibility; native
+revalidation remains a separate parent-owned action, not an offline-test claim.

@@ -74,6 +74,7 @@ print(sys.stdin.read(), end='')
             self.assertTrue((evidence / f'{package}.jsonl').exists())
 
     def test_default_driver_probe_is_read_only_and_fails_closed(self):
+        # Replay run 43674026655's CLI incompatibility: inspect has no --format.
         self.executable('docker', '''import json, os, sys
 args = sys.argv[1:]
 with open(os.environ['CALLS'], 'a') as out:
@@ -82,25 +83,41 @@ if args == ['context', 'show']:
     print('default')
 elif args == ['context', 'inspect', 'default', '--format', '{{.Endpoints.docker.Host}}']:
     print('unix:///var/run/docker.sock')
-elif args == ['buildx', 'inspect', 'default', '--format', '{{.Driver}}']:
-    print(os.environ['DRIVER'])
+elif args[:3] == ['buildx', 'inspect', 'default'] and '--format' in args:
+    print('unknown flag: --format\\nUsage: docker buildx inspect [NAME]', file=sys.stderr)
+    sys.exit(125)
+elif args == ['buildx', 'inspect', 'default']:
+    print(os.environ['INSPECTION'])
+    sys.exit(int(os.environ['INSPECT_STATUS']))
 else:
     sys.exit(99)
 ''')
-        for driver in ('docker', 'docker-container', 'remote'):
-            with self.subTest(driver=driver):
-                calls = self.root / (driver + '.jsonl')
+        cases = (
+            ('docker', 'Name: default\nDriver: docker\nNodes: node0', 0, 0),
+            ('spacing', 'Name: default\nDriver:    docker  \nNodes: node0', 0, 0),
+            ('docker-container', 'Driver: docker-container', 0, 1),
+            ('remote', 'Driver: remote', 0, 1),
+            ('missing', 'Name: default\nNodes: node0', 0, 1),
+            ('duplicate', 'Driver: docker\nDriver: docker', 0, 1),
+            ('mixed', 'Driver: docker\nDriver: remote', 0, 1),
+            ('extra-value', 'Driver: docker extra', 0, 1),
+            ('failed-command', 'Driver: docker', 125, 125),
+        )
+        for name, inspection, status, expected in cases:
+            with self.subTest(case=name):
+                calls = self.root / (name + '.jsonl')
                 env = {k: v for k, v in os.environ.items() if k not in ('DOCKER_HOST', 'DOCKER_CONTEXT')}
-                env.update(PATH=f'{self.root}:{os.environ["PATH"]}', CALLS=str(calls), DRIVER=driver)
+                env.update(PATH=f'{self.root}:{os.environ["PATH"]}', CALLS=str(calls),
+                           INSPECTION=inspection, INSPECT_STATUS=str(status))
                 result = subprocess.run(['bash', str(HERE / 'verify-driver.sh')], env=env,
                                         capture_output=True, text=True)
-                self.assertEqual(result.returncode, 0 if driver == 'docker' else 1, result.stderr)
+                self.assertEqual(result.returncode, expected, result.stderr)
                 self.assertTrue(calls.exists(), result.stderr)
                 requests = [json.loads(line) for line in calls.read_text().splitlines()]
                 self.assertEqual(requests, [
                     ['context', 'show'],
                     ['context', 'inspect', 'default', '--format', '{{.Endpoints.docker.Host}}'],
-                    ['buildx', 'inspect', 'default', '--format', '{{.Driver}}'],
+                    ['buildx', 'inspect', 'default'],
                 ])
         for override in ('DOCKER_HOST', 'DOCKER_CONTEXT'):
             env[override] = 'unexpected'
